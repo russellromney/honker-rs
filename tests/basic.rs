@@ -50,14 +50,14 @@ fn retry_to_dead() {
     assert!(job2.retry(0, "second").unwrap());
     assert!(q.claim_one("w").unwrap().is_none(), "should be in dead now");
 
-    let dead_count: i64 = db
-        .conn()
-        .query_row(
+    let dead_count: i64 = db.with_conn(|c| {
+        c.query_row(
             "SELECT COUNT(*) FROM _honker_dead WHERE queue='retries'",
             [],
             |r| r.get(0),
         )
-        .unwrap();
+        .unwrap()
+    });
     assert_eq!(dead_count, 1);
 }
 
@@ -68,14 +68,14 @@ fn notify_inserts_row() {
     let id = db.notify("orders", &json!({"id": 42})).unwrap();
     assert!(id > 0);
 
-    let (channel, payload): (String, String) = db
-        .conn()
-        .query_row(
+    let (channel, payload): (String, String) = db.with_conn(|c| {
+        c.query_row(
             "SELECT channel, payload FROM _honker_notifications WHERE id = ?1",
             [id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .unwrap();
+        .unwrap()
+    });
     assert_eq!(channel, "orders");
     assert_eq!(payload, r#"{"id":42}"#);
 }

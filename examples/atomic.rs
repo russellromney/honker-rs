@@ -1,9 +1,8 @@
 //! Atomic business-write + enqueue in one transaction.
 //!
-//! honker.Queue.enqueue can be called inside a connection-level
-//! transaction alongside your own INSERTs. If the transaction
-//! commits, both writes land; if it rolls back, both vanish. No
-//! dual-write, no outbox table.
+//! `db.transaction()` pins the connection for its lifetime; any
+//! INSERTs you run plus `q.enqueue_tx(&tx, ...)` commit together or
+//! not at all. No dual-write, no outbox table.
 //!
 //!     cargo run --release --example atomic
 
@@ -17,65 +16,74 @@ fn main() -> honker::Result<()> {
     let db = Database::open(&db_path)?;
 
     // Plain business table — nothing honker-specific.
-    db.conn().execute(
-        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)",
-        [],
-    )?;
+    db.with_conn(|c| {
+        c.execute(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)",
+            [],
+        )
+        .map(|_| ())
+    })
+    .expect("create orders");
 
     let q = db.queue("emails", QueueOpts::default());
 
     // Success path: order INSERT and job enqueue commit together.
-    // The honker::Queue calls honker_enqueue under the hood; calling
-    // q.enqueue inside a transaction on the same connection makes
-    // it atomic.
-    db.conn().execute("BEGIN IMMEDIATE", [])?;
-    db.conn().execute(
-        "INSERT INTO orders (user_id, total) VALUES (?, ?)",
-        params![42, 9900],
-    )?;
-    q.enqueue(
-        &json!({"to": "alice@example.com", "order_id": 42}),
-        EnqueueOpts::default(),
-    )?;
-    db.conn().execute("COMMIT", [])?;
+    {
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO orders (user_id, total) VALUES (?1, ?2)",
+            params![42, 9900],
+        )?;
+        q.enqueue_tx(
+            &tx,
+            &json!({"to": "alice@example.com", "order_id": 42}),
+            EnqueueOpts::default(),
+        )?;
+        tx.commit()?;
+    }
 
-    let orders: i64 = db
-        .conn()
-        .query_row("SELECT COUNT(*) FROM orders", [], |r| r.get(0))?;
-    let queued: i64 = db.conn().query_row(
-        "SELECT COUNT(*) FROM _honker_live WHERE queue='emails'",
-        [],
-        |r| r.get(0),
-    )?;
+    let (orders, queued) = counts(&db);
     println!("committed: {} order(s), {} job(s)", orders, queued);
     assert_eq!(orders, 1);
     assert_eq!(queued, 1);
 
     // Rollback path: everything disappears.
-    db.conn().execute("BEGIN IMMEDIATE", [])?;
-    db.conn().execute(
-        "INSERT INTO orders (user_id, total) VALUES (?, ?)",
-        params![43, 5000],
-    )?;
-    q.enqueue(
-        &json!({"to": "bob@example.com", "order_id": 43}),
-        EnqueueOpts::default(),
-    )?;
-    db.conn().execute("ROLLBACK", [])?;
+    {
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO orders (user_id, total) VALUES (?1, ?2)",
+            params![43, 5000],
+        )?;
+        q.enqueue_tx(
+            &tx,
+            &json!({"to": "bob@example.com", "order_id": 43}),
+            EnqueueOpts::default(),
+        )?;
+        tx.rollback()?;
+    }
     println!("rolled back: simulated payment-processing failure");
 
-    let orders: i64 = db
-        .conn()
-        .query_row("SELECT COUNT(*) FROM orders", [], |r| r.get(0))?;
-    let queued: i64 = db.conn().query_row(
-        "SELECT COUNT(*) FROM _honker_live WHERE queue='emails'",
-        [],
-        |r| r.get(0),
-    )?;
+    let (orders, queued) = counts(&db);
     println!("after rollback: {} order(s), {} job(s)", orders, queued);
     assert_eq!(orders, 1);
     assert_eq!(queued, 1);
 
     println!("atomic enqueue + rollback both work as expected");
     Ok(())
+}
+
+fn counts(db: &Database) -> (i64, i64) {
+    db.with_conn(|c| {
+        let orders: i64 = c
+            .query_row("SELECT COUNT(*) FROM orders", [], |r| r.get(0))
+            .unwrap();
+        let queued: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_live WHERE queue='emails'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (orders, queued)
+    })
 }

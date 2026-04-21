@@ -177,6 +177,7 @@ name = "honker"
 version = "0.1.0"
 dependencies = [
  "honker-core",
+ "parking_lot",
  "rusqlite",
  "serde",
  "serde_json",

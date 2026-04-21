@@ -1,4 +1,4 @@
-//! Ergonomic Rust wrapper over `honker-core` — Durable queues,
+//! Ergonomic Rust wrapper over `honker-core`. Durable queues,
 //! streams, pub/sub, and scheduler on SQLite.
 //!
 //! ```no_run
@@ -11,21 +11,27 @@
 //! q.enqueue(&json!({"to": "alice@example.com"}), EnqueueOpts::default()).unwrap();
 //!
 //! if let Some(job) = q.claim_one("worker-1").unwrap() {
-//!     // ... process ...
 //!     job.ack().unwrap();
 //! }
 //! ```
 //!
-//! This crate opens its own connection + registers every `honker_*`
-//! SQL function via `honker_core::attach_honker_functions`. No
-//! `.dylib` load needed at runtime — the functions compile in with
-//! the crate. Use the loadable extension path (`honker-extension`)
-//! only when mixing with other SQLite clients (e.g. the `sqlite3`
-//! CLI or other-language bindings on the same file).
+//! This crate opens its own connection, registers every `honker_*`
+//! SQL function via `honker_core::attach_honker_functions`, and
+//! bootstraps the schema. No `.dylib` load needed at runtime.
+//! Use the loadable extension (`honker-extension`) only when mixing
+//! with other SQLite clients on the same file.
 
-use rusqlite::{Connection, params};
-use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::Arc;
+use std::time::Duration;
+
+use parking_lot::{Mutex, MutexGuard};
+use rusqlite::{params, Connection};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
+
+use honker_core::SharedWalWatcher;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -35,62 +41,307 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("core error: {0}")]
     Core(String),
+    #[error("wal channel closed")]
+    WalClosed,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A Honker database handle. Wraps a single `rusqlite::Connection`
-/// configured with WAL mode, the default PRAGMAs, and every
-/// `honker_*` SQL function pre-registered.
+// ---------------------------------------------------------------------
+// Shared connection handle
+// ---------------------------------------------------------------------
+
+struct Inner {
+    conn: Mutex<Connection>,
+    wal: SharedWalWatcher,
+}
+
+impl Inner {
+    fn with_conn<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&Connection) -> R,
+    {
+        let guard = self.conn.lock();
+        f(&guard)
+    }
+}
+
+/// A Honker database handle. Cheap to clone — internally an `Arc`.
+///
+/// Concurrency: every operation serializes through a single
+/// `Connection` behind a mutex. SQLite in WAL mode allows many
+/// concurrent reader *processes*, but in-process this wrapper is
+/// single-threaded. Open additional `Database` instances for
+/// parallel readers inside one process.
+#[derive(Clone)]
 pub struct Database {
-    conn: Connection,
+    inner: Arc<Inner>,
 }
 
 impl Database {
     /// Open (or create) a SQLite database at `path`. Applies default
     /// PRAGMAs, registers the honker SQL functions, and bootstraps
     /// the schema.
-    pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        let path_str = path.as_ref().to_string_lossy().into_owned();
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path_ref = path.as_ref();
+        let path_str = path_ref.to_string_lossy().into_owned();
+
         let conn = honker_core::open_conn(&path_str, true)
             .map_err(|e| Error::Core(e.to_string()))?;
         honker_core::attach_honker_functions(&conn)?;
         honker_core::bootstrap_honker_schema(&conn)
             .map_err(|e| Error::Core(e.to_string()))?;
-        Ok(Self { conn })
+
+        let wal_path = wal_path_for(path_ref);
+        let wal = SharedWalWatcher::new(wal_path);
+
+        Ok(Self {
+            inner: Arc::new(Inner {
+                conn: Mutex::new(conn),
+                wal,
+            }),
+        })
     }
 
-    /// Get a named queue handle. Opts default to 300s visibility,
+    /// Get a named queue handle. Defaults: 300s visibility timeout,
     /// 3 max attempts.
-    pub fn queue(&self, name: &str, opts: QueueOpts) -> Queue<'_> {
+    pub fn queue(&self, name: &str, opts: QueueOpts) -> Queue {
         Queue {
-            db: self,
+            inner: self.inner.clone(),
             name: name.to_string(),
             opts,
         }
     }
 
-    /// Fire a `pg_notify`-style pub/sub signal. Payload is any
-    /// `Serialize` type (unlike `notify()` in raw SQL, which takes
-    /// a string — this wrapper JSON-encodes on your behalf).
-    /// Returns the notification row id.
-    pub fn notify<P: Serialize>(&self, channel: &str, payload: &P) -> Result<i64> {
-        let json = serde_json::to_string(payload)?;
-        let id = self.conn.query_row(
-            "SELECT notify(?1, ?2)",
-            params![channel, json],
-            |r| r.get(0),
-        )?;
-        Ok(id)
+    /// Get a named stream handle.
+    pub fn stream(&self, name: &str) -> Stream {
+        Stream {
+            inner: self.inner.clone(),
+            name: name.to_string(),
+        }
     }
 
-    /// Escape hatch: the underlying connection for advanced queries
-    /// (e.g. reading `_honker_live` directly or joining to your own
-    /// business tables in the same transaction).
-    pub fn conn(&self) -> &Connection {
-        &self.conn
+    /// Scheduler facade. Cheap; does not allocate persistent state.
+    pub fn scheduler(&self) -> Scheduler {
+        Scheduler {
+            inner: self.inner.clone(),
+        }
+    }
+
+    /// Fire a `pg_notify`-style pub/sub signal. Payload is serialized
+    /// via `serde_json`. Returns the notification row id.
+    pub fn notify<P: Serialize>(&self, channel: &str, payload: &P) -> Result<i64> {
+        let json = serde_json::to_string(payload)?;
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT notify(?1, ?2)",
+                params![channel, json],
+                |r| r.get::<_, i64>(0),
+            )
+        })?)
+    }
+
+    /// Subscribe to a channel. Returns a blocking iterator that wakes
+    /// on WAL commits and yields rows where `channel = ?` and
+    /// `id > MAX(id)` at attach time. Historical notifications are
+    /// not replayed.
+    pub fn listen(&self, channel: &str) -> Result<Subscription> {
+        let last_id: i64 = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM _honker_notifications",
+                [],
+                |r| r.get(0),
+            )
+        })?;
+        let (sub_id, rx) = self.inner.wal.subscribe();
+        Ok(Subscription {
+            inner: self.inner.clone(),
+            sub_id,
+            rx,
+            channel: channel.to_string(),
+            last_id,
+            pending: std::collections::VecDeque::new(),
+            closed: false,
+        })
+    }
+
+    /// Raw WAL-commit waker. `WalEvents::recv` blocks until the next
+    /// `.db-wal` change; `try_recv` is non-blocking. Useful when you
+    /// want to drive a custom poll loop (batch claim, custom stream
+    /// read pattern) without polling SQLite on a timer.
+    pub fn wal_events(&self) -> WalEvents {
+        let (sub_id, rx) = self.inner.wal.subscribe();
+        WalEvents {
+            inner: self.inner.clone(),
+            sub_id,
+            rx,
+        }
+    }
+
+    /// Begin a transaction. Commit or rollback explicitly; on drop,
+    /// an uncommitted transaction is rolled back.
+    ///
+    /// Hold the returned `Transaction` on ONE thread: it pins the
+    /// connection mutex for its lifetime. Other `Database` calls on
+    /// the same connection (from another thread) block until you
+    /// commit or drop.
+    pub fn transaction(&self) -> Result<Transaction<'_>> {
+        let guard = self.inner.conn.lock();
+        guard.execute("BEGIN IMMEDIATE", [])?;
+        Ok(Transaction { guard, done: false })
+    }
+
+    /// Try to acquire an advisory lock. Returns `Some(Lock)` if you
+    /// won, `None` if someone else holds it. The returned `Lock`
+    /// releases on drop or via `Lock::release`.
+    pub fn try_lock(&self, name: &str, owner: &str, ttl_s: i64) -> Result<Option<Lock>> {
+        let acquired: i64 = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_lock_acquire(?1, ?2, ?3)",
+                params![name, owner, ttl_s],
+                |r| r.get(0),
+            )
+        })?;
+        if acquired == 1 {
+            Ok(Some(Lock {
+                inner: self.inner.clone(),
+                name: name.to_string(),
+                owner: owner.to_string(),
+                released: false,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Fixed-window rate limit. Returns true if the request fits
+    /// within `limit` per `per` seconds.
+    pub fn try_rate_limit(&self, name: &str, limit: i64, per: i64) -> Result<bool> {
+        let ok: i64 = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_rate_limit_try(?1, ?2, ?3)",
+                params![name, limit, per],
+                |r| r.get(0),
+            )
+        })?;
+        Ok(ok == 1)
+    }
+
+    /// Persist a job result for later retrieval via `get_result`.
+    pub fn save_result(&self, job_id: i64, value: &str, ttl_s: i64) -> Result<()> {
+        self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_result_save(?1, ?2, ?3)",
+                params![job_id, value, ttl_s],
+                |_| Ok(()),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Fetch a stored result. Returns `None` if absent or expired.
+    pub fn get_result(&self, job_id: i64) -> Result<Option<String>> {
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_result_get(?1)",
+                params![job_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+        })?)
+    }
+
+    /// Drop expired results. Returns rows deleted.
+    pub fn sweep_results(&self) -> Result<i64> {
+        Ok(self.inner.with_conn(|c| {
+            c.query_row("SELECT honker_result_sweep()", [], |r| r.get::<_, i64>(0))
+        })?)
+    }
+
+    /// Delete notifications older than `older_than_s` seconds.
+    pub fn prune_notifications(&self, older_than_s: i64) -> Result<i64> {
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "DELETE FROM _honker_notifications
+                 WHERE created_at < unixepoch() - ?1
+                 RETURNING (SELECT changes())",
+                params![older_than_s],
+                |r| r.get::<_, i64>(0),
+            ).or_else(|_| Ok::<i64, rusqlite::Error>(0))
+        })?)
+    }
+
+    /// Escape hatch: run a closure with a borrowed `&Connection`. The
+    /// connection mutex is held for the closure's lifetime.
+    pub fn with_conn<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&Connection) -> R,
+    {
+        self.inner.with_conn(f)
     }
 }
+
+fn wal_path_for(db_path: &Path) -> PathBuf {
+    let mut s = db_path.as_os_str().to_os_string();
+    s.push("-wal");
+    PathBuf::from(s)
+}
+
+// ---------------------------------------------------------------------
+// Transactions
+// ---------------------------------------------------------------------
+
+/// An open transaction. Pins the database's connection mutex for its
+/// lifetime. Call [`commit`](Self::commit) or [`rollback`](Self::rollback)
+/// to release; on drop without either, the transaction rolls back.
+pub struct Transaction<'db> {
+    guard: MutexGuard<'db, Connection>,
+    done: bool,
+}
+
+impl<'db> Transaction<'db> {
+    /// Run an `execute` on this transaction's connection.
+    pub fn execute<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<usize> {
+        Ok(self.guard.execute(sql, params)?)
+    }
+
+    /// Run a `query_row` on this transaction's connection.
+    pub fn query_row<T, P, F>(&self, sql: &str, params: P, f: F) -> Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        Ok(self.guard.query_row(sql, params, f)?)
+    }
+
+    /// The underlying connection. Use for `prepare` and custom queries.
+    pub fn conn(&self) -> &Connection {
+        &self.guard
+    }
+
+    pub fn commit(mut self) -> Result<()> {
+        self.guard.execute("COMMIT", [])?;
+        self.done = true;
+        Ok(())
+    }
+
+    pub fn rollback(mut self) -> Result<()> {
+        self.guard.execute("ROLLBACK", [])?;
+        self.done = true;
+        Ok(())
+    }
+}
+
+impl<'db> Drop for Transaction<'db> {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.guard.execute("ROLLBACK", []);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Queues
+// ---------------------------------------------------------------------
 
 /// Per-queue configuration.
 #[derive(Debug, Clone)]
@@ -108,14 +359,8 @@ impl Default for QueueOpts {
     }
 }
 
-pub struct Queue<'a> {
-    db: &'a Database,
-    name: String,
-    opts: QueueOpts,
-}
-
-/// Per-enqueue options. `Delay` / `RunAt` / `Expires` use `Option<i64>`
-/// so callers can distinguish unset from zero.
+/// Per-enqueue options. Use `Option<i64>` so callers distinguish
+/// unset from zero.
 #[derive(Debug, Clone, Default)]
 pub struct EnqueueOpts {
     pub delay: Option<i64>,
@@ -124,39 +369,51 @@ pub struct EnqueueOpts {
     pub expires: Option<i64>,
 }
 
-impl<'a> Queue<'a> {
-    /// Enqueue a job. Payload is serialized via `serde_json`.
-    /// Returns the new row's id.
+pub struct Queue {
+    inner: Arc<Inner>,
+    name: String,
+    opts: QueueOpts,
+}
+
+impl Queue {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Enqueue on a freshly acquired connection.
     pub fn enqueue<P: Serialize>(&self, payload: &P, opts: EnqueueOpts) -> Result<i64> {
         let json = serde_json::to_string(payload)?;
-        let id = self.db.conn.query_row(
-            "SELECT honker_enqueue(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                self.name,
-                json,
-                opts.run_at,
-                opts.delay,
-                opts.priority,
-                self.opts.max_attempts,
-                opts.expires
-            ],
-            |r| r.get(0),
-        )?;
-        Ok(id)
+        Ok(self.inner.with_conn(|c| {
+            enqueue_on(c, &self.name, &json, self.opts.max_attempts, &opts)
+        })?)
+    }
+
+    /// Enqueue inside an open transaction. Atomic with whatever else
+    /// ran on the same `tx`.
+    pub fn enqueue_tx<P: Serialize>(
+        &self,
+        tx: &Transaction<'_>,
+        payload: &P,
+        opts: EnqueueOpts,
+    ) -> Result<i64> {
+        let json = serde_json::to_string(payload)?;
+        Ok(enqueue_on(tx.conn(), &self.name, &json, self.opts.max_attempts, &opts)?)
     }
 
     /// Atomically claim up to `n` jobs.
-    pub fn claim_batch(&self, worker_id: &str, n: i64) -> Result<Vec<Job<'a>>> {
-        let rows_json: String = self.db.conn.query_row(
-            "SELECT honker_claim_batch(?1, ?2, ?3, ?4)",
-            params![self.name, worker_id, n, self.opts.visibility_timeout_s],
-            |r| r.get(0),
-        )?;
+    pub fn claim_batch(&self, worker_id: &str, n: i64) -> Result<Vec<Job>> {
+        let rows_json: String = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_claim_batch(?1, ?2, ?3, ?4)",
+                params![self.name, worker_id, n, self.opts.visibility_timeout_s],
+                |r| r.get(0),
+            )
+        })?;
         let raw: Vec<RawJob> = serde_json::from_str(&rows_json)?;
         Ok(raw
             .into_iter()
             .map(|r| Job {
-                db: self.db,
+                inner: self.inner.clone(),
                 id: r.id,
                 queue: r.queue,
                 payload: r.payload.into_bytes(),
@@ -167,9 +424,69 @@ impl<'a> Queue<'a> {
     }
 
     /// Claim a single job, or `None` if the queue is empty.
-    pub fn claim_one(&self, worker_id: &str) -> Result<Option<Job<'a>>> {
+    pub fn claim_one(&self, worker_id: &str) -> Result<Option<Job>> {
         Ok(self.claim_batch(worker_id, 1)?.into_iter().next())
     }
+
+    /// Ack multiple jobs in one transaction. Returns count acked.
+    pub fn ack_batch(&self, ids: &[i64], worker_id: &str) -> Result<i64> {
+        let ids_json = serde_json::to_string(ids)?;
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_ack_batch(?1, ?2)",
+                params![ids_json, worker_id],
+                |r| r.get::<_, i64>(0),
+            )
+        })?)
+    }
+
+    /// Sweep expired processing rows back to pending. Returns rows touched.
+    pub fn sweep_expired(&self) -> Result<i64> {
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_sweep_expired(?1)",
+                params![self.name],
+                |r| r.get::<_, i64>(0),
+            )
+        })?)
+    }
+
+    /// Wait on WAL commits and yield jobs as they land. Blocks. Cancel
+    /// by dropping the `Database` or calling `stop()` on a shared
+    /// `Arc<AtomicBool>` you thread in yourself — this helper is the
+    /// minimum that actually replaces a polling loop.
+    pub fn claim_waker(&self) -> ClaimWaker {
+        let (sub_id, rx) = self.inner.wal.subscribe();
+        ClaimWaker {
+            inner: self.inner.clone(),
+            name: self.name.clone(),
+            visibility_timeout_s: self.opts.visibility_timeout_s,
+            sub_id,
+            rx,
+        }
+    }
+}
+
+fn enqueue_on(
+    conn: &Connection,
+    queue: &str,
+    payload_json: &str,
+    max_attempts: i64,
+    opts: &EnqueueOpts,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT honker_enqueue(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            queue,
+            payload_json,
+            opts.run_at,
+            opts.delay,
+            opts.priority,
+            max_attempts,
+            opts.expires
+        ],
+        |r| r.get::<_, i64>(0),
+    )
 }
 
 #[derive(Deserialize)]
@@ -184,10 +501,9 @@ struct RawJob {
     claim_expires_at: i64,
 }
 
-/// A claimed unit of work. `payload` is the raw JSON bytes — deserialize
-/// into your own struct via `serde_json::from_slice(&job.payload)`.
-pub struct Job<'a> {
-    db: &'a Database,
+/// A claimed unit of work. `payload` is raw JSON bytes.
+pub struct Job {
+    inner: Arc<Inner>,
     pub id: i64,
     pub queue: String,
     pub payload: Vec<u8>,
@@ -195,51 +511,735 @@ pub struct Job<'a> {
     pub attempts: i64,
 }
 
-impl<'a> Job<'a> {
-    /// Deserialize the payload into `T`. Convenience for
-    /// `serde_json::from_slice(&job.payload)`.
-    pub fn payload_as<T: for<'de> serde::Deserialize<'de>>(&self) -> Result<T> {
+impl Job {
+    pub fn payload_as<T: DeserializeOwned>(&self) -> Result<T> {
         Ok(serde_json::from_slice(&self.payload)?)
     }
 
-    /// DELETE the row if the claim is still valid. Returns true iff
-    /// the claim hadn't expired.
+    /// DELETE the row if the claim is still valid.
     pub fn ack(&self) -> Result<bool> {
-        let n: i64 = self.db.conn.query_row(
-            "SELECT honker_ack(?1, ?2)",
-            params![self.id, self.worker_id],
-            |r| r.get(0),
-        )?;
+        let n: i64 = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_ack(?1, ?2)",
+                params![self.id, self.worker_id],
+                |r| r.get(0),
+            )
+        })?;
         Ok(n > 0)
     }
 
-    /// Put the job back with a delay, or move to dead after max_attempts.
+    /// Put the job back with a delay, or move to `_honker_dead` after
+    /// `max_attempts` retries.
     pub fn retry(&self, delay_s: i64, error: &str) -> Result<bool> {
-        let n: i64 = self.db.conn.query_row(
-            "SELECT honker_retry(?1, ?2, ?3, ?4)",
-            params![self.id, self.worker_id, delay_s, error],
-            |r| r.get(0),
-        )?;
+        let n: i64 = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_retry(?1, ?2, ?3, ?4)",
+                params![self.id, self.worker_id, delay_s, error],
+                |r| r.get(0),
+            )
+        })?;
         Ok(n > 0)
     }
 
     /// Unconditionally move the claim to `_honker_dead`.
     pub fn fail(&self, error: &str) -> Result<bool> {
-        let n: i64 = self.db.conn.query_row(
-            "SELECT honker_fail(?1, ?2, ?3)",
-            params![self.id, self.worker_id, error],
+        let n: i64 = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_fail(?1, ?2, ?3)",
+                params![self.id, self.worker_id, error],
+                |r| r.get(0),
+            )
+        })?;
+        Ok(n > 0)
+    }
+
+    /// Extend the visibility timeout. Returns false if the claim has
+    /// already expired or been taken by someone else.
+    pub fn heartbeat(&self, extend_s: i64) -> Result<bool> {
+        let n: i64 = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_heartbeat(?1, ?2, ?3)",
+                params![self.id, self.worker_id, extend_s],
+                |r| r.get(0),
+            )
+        })?;
+        Ok(n > 0)
+    }
+}
+
+/// WAL-wake claim helper. Call `next(worker_id)` to claim the next
+/// available job; blocks until one arrives.
+pub struct ClaimWaker {
+    inner: Arc<Inner>,
+    name: String,
+    visibility_timeout_s: i64,
+    sub_id: u64,
+    rx: Receiver<()>,
+}
+
+impl ClaimWaker {
+    /// Block until a job is claimable, then claim and return it.
+    /// Returns `None` only if the shared WAL watcher is dropped.
+    pub fn next(&self, worker_id: &str) -> Result<Option<Job>> {
+        loop {
+            let rows_json: String = self.inner.with_conn(|c| {
+                c.query_row(
+                    "SELECT honker_claim_batch(?1, ?2, ?3, ?4)",
+                    params![self.name, worker_id, 1, self.visibility_timeout_s],
+                    |r| r.get(0),
+                )
+            })?;
+            let raw: Vec<RawJob> = serde_json::from_str(&rows_json)?;
+            if let Some(r) = raw.into_iter().next() {
+                return Ok(Some(Job {
+                    inner: self.inner.clone(),
+                    id: r.id,
+                    queue: r.queue,
+                    payload: r.payload.into_bytes(),
+                    worker_id: r.worker_id,
+                    attempts: r.attempts,
+                }));
+            }
+            // Drain any pending ticks so we don't busy-spin on a
+            // backlog of wakes that already missed their payload.
+            while self.rx.try_recv().is_ok() {}
+            match self.rx.recv() {
+                Ok(()) => continue,
+                Err(_) => return Ok(None),
+            }
+        }
+    }
+
+    /// Try to claim without blocking. Returns `None` if the queue is
+    /// empty right now.
+    pub fn try_next(&self, worker_id: &str) -> Result<Option<Job>> {
+        let rows_json: String = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_claim_batch(?1, ?2, ?3, ?4)",
+                params![self.name, worker_id, 1, self.visibility_timeout_s],
+                |r| r.get(0),
+            )
+        })?;
+        let raw: Vec<RawJob> = serde_json::from_str(&rows_json)?;
+        Ok(raw.into_iter().next().map(|r| Job {
+            inner: self.inner.clone(),
+            id: r.id,
+            queue: r.queue,
+            payload: r.payload.into_bytes(),
+            worker_id: r.worker_id,
+            attempts: r.attempts,
+        }))
+    }
+}
+
+impl Drop for ClaimWaker {
+    fn drop(&mut self) {
+        self.inner.wal.unsubscribe(self.sub_id);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Streams
+// ---------------------------------------------------------------------
+
+pub struct Stream {
+    inner: Arc<Inner>,
+    name: String,
+}
+
+impl Stream {
+    pub fn topic(&self) -> &str {
+        &self.name
+    }
+
+    /// Publish an event. Returns the assigned offset.
+    pub fn publish<P: Serialize>(&self, payload: &P) -> Result<i64> {
+        self.publish_with_key_opt(None, payload)
+    }
+
+    /// Publish with a partition key (used for per-key ordering downstream).
+    pub fn publish_with_key<P: Serialize>(&self, key: &str, payload: &P) -> Result<i64> {
+        self.publish_with_key_opt(Some(key), payload)
+    }
+
+    /// Publish inside an open transaction.
+    pub fn publish_tx<P: Serialize>(&self, tx: &Transaction<'_>, payload: &P) -> Result<i64> {
+        let json = serde_json::to_string(payload)?;
+        tx.query_row(
+            "SELECT honker_stream_publish(?1, NULL, ?2)",
+            params![self.name, json],
+            |r| r.get::<_, i64>(0),
+        )
+    }
+
+    fn publish_with_key_opt<P: Serialize>(&self, key: Option<&str>, payload: &P) -> Result<i64> {
+        let json = serde_json::to_string(payload)?;
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_stream_publish(?1, ?2, ?3)",
+                params![self.name, key, json],
+                |r| r.get::<_, i64>(0),
+            )
+        })?)
+    }
+
+    /// Read events after `offset`, up to `limit`.
+    pub fn read_since(&self, offset: i64, limit: i64) -> Result<Vec<StreamEvent>> {
+        let rows_json: String = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_stream_read_since(?1, ?2, ?3)",
+                params![self.name, offset, limit],
+                |r| r.get(0),
+            )
+        })?;
+        let raw: Vec<RawStreamEvent> = serde_json::from_str(&rows_json)?;
+        Ok(raw.into_iter().map(StreamEvent::from).collect())
+    }
+
+    /// Read events after this consumer's saved offset. Does NOT advance
+    /// the offset — call `save_offset` after processing.
+    pub fn read_from_consumer(
+        &self,
+        consumer: &str,
+        limit: i64,
+    ) -> Result<Vec<StreamEvent>> {
+        let offset = self.get_offset(consumer)?;
+        self.read_since(offset, limit)
+    }
+
+    /// Save a consumer's offset. Monotonic: saving a lower offset is ignored.
+    pub fn save_offset(&self, consumer: &str, offset: i64) -> Result<bool> {
+        let n: i64 = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_stream_save_offset(?1, ?2, ?3)",
+                params![consumer, self.name, offset],
+                |r| r.get(0),
+            )
+        })?;
+        Ok(n > 0)
+    }
+
+    /// Save offset inside an open transaction. Use this when you want
+    /// exactly-once-within-a-business-transaction semantics.
+    pub fn save_offset_tx(
+        &self,
+        tx: &Transaction<'_>,
+        consumer: &str,
+        offset: i64,
+    ) -> Result<bool> {
+        let n: i64 = tx.query_row(
+            "SELECT honker_stream_save_offset(?1, ?2, ?3)",
+            params![consumer, self.name, offset],
             |r| r.get(0),
         )?;
         Ok(n > 0)
     }
 
-    /// Extend the visibility timeout.
-    pub fn heartbeat(&self, extend_s: i64) -> Result<bool> {
-        let n: i64 = self.db.conn.query_row(
-            "SELECT honker_heartbeat(?1, ?2, ?3)",
-            params![self.id, self.worker_id, extend_s],
-            |r| r.get(0),
-        )?;
+    /// Current saved offset for `consumer`, or 0 if never saved.
+    pub fn get_offset(&self, consumer: &str) -> Result<i64> {
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_stream_get_offset(?1, ?2)",
+                params![consumer, self.name],
+                |r| r.get::<_, i64>(0),
+            )
+        })?)
+    }
+
+    /// Subscribe as a named consumer. Resumes from saved offset, wakes
+    /// on WAL commits, auto-saves after `save_every_n` events (or on
+    /// drop). Blocking iterator.
+    pub fn subscribe(&self, consumer: &str) -> Result<StreamSubscription> {
+        let offset = self.get_offset(consumer)?;
+        let (sub_id, rx) = self.inner.wal.subscribe();
+        Ok(StreamSubscription {
+            inner: self.inner.clone(),
+            topic: self.name.clone(),
+            consumer: consumer.to_string(),
+            sub_id,
+            rx,
+            last_offset: offset,
+            last_saved: offset,
+            save_every_n: 1000,
+            pending: std::collections::VecDeque::new(),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct RawStreamEvent {
+    offset: i64,
+    topic: String,
+    key: Option<String>,
+    payload: String,
+    created_at: i64,
+}
+
+pub struct StreamEvent {
+    pub offset: i64,
+    pub topic: String,
+    pub key: Option<String>,
+    pub payload: Vec<u8>,
+    pub created_at: i64,
+}
+
+impl StreamEvent {
+    pub fn payload_as<T: DeserializeOwned>(&self) -> Result<T> {
+        Ok(serde_json::from_slice(&self.payload)?)
+    }
+}
+
+impl From<RawStreamEvent> for StreamEvent {
+    fn from(r: RawStreamEvent) -> Self {
+        Self {
+            offset: r.offset,
+            topic: r.topic,
+            key: r.key,
+            payload: r.payload.into_bytes(),
+            created_at: r.created_at,
+        }
+    }
+}
+
+/// Iterator over stream events for a named consumer. Saves offset
+/// every `save_every_n` events and again on drop.
+pub struct StreamSubscription {
+    inner: Arc<Inner>,
+    topic: String,
+    consumer: String,
+    sub_id: u64,
+    rx: Receiver<()>,
+    last_offset: i64,
+    last_saved: i64,
+    save_every_n: i64,
+    pending: std::collections::VecDeque<StreamEvent>,
+}
+
+impl StreamSubscription {
+    /// Override the auto-save batch size. `0` disables auto-save —
+    /// call `save_offset` manually (often inside a business tx).
+    pub fn save_every(mut self, n: i64) -> Self {
+        self.save_every_n = n;
+        self
+    }
+
+    /// Current offset of the last-yielded event.
+    pub fn offset(&self) -> i64 {
+        self.last_offset
+    }
+
+    /// Explicitly persist the current offset.
+    pub fn save_offset(&mut self) -> Result<()> {
+        if self.last_offset > self.last_saved {
+            let n: i64 = self.inner.with_conn(|c| {
+                c.query_row(
+                    "SELECT honker_stream_save_offset(?1, ?2, ?3)",
+                    params![self.consumer, self.topic, self.last_offset],
+                    |r| r.get(0),
+                )
+            })?;
+            if n > 0 {
+                self.last_saved = self.last_offset;
+            }
+        }
+        Ok(())
+    }
+
+    fn refill(&mut self) -> Result<()> {
+        let rows_json: String = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_stream_read_since(?1, ?2, ?3)",
+                params![self.topic, self.last_offset, 100],
+                |r| r.get(0),
+            )
+        })?;
+        let raw: Vec<RawStreamEvent> = serde_json::from_str(&rows_json)?;
+        for r in raw {
+            self.pending.push_back(StreamEvent::from(r));
+        }
+        Ok(())
+    }
+}
+
+impl Iterator for StreamSubscription {
+    type Item = Result<StreamEvent>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(ev) = self.pending.pop_front() {
+                self.last_offset = ev.offset;
+                if self.save_every_n > 0 && self.last_offset - self.last_saved >= self.save_every_n
+                    && let Err(e) = self.save_offset() {
+                        return Some(Err(e));
+                    }
+                return Some(Ok(ev));
+            }
+            if let Err(e) = self.refill() {
+                return Some(Err(e));
+            }
+            if !self.pending.is_empty() {
+                continue;
+            }
+            while self.rx.try_recv().is_ok() {}
+            match self.rx.recv() {
+                Ok(()) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+impl Drop for StreamSubscription {
+    fn drop(&mut self) {
+        let _ = self.save_offset();
+        self.inner.wal.unsubscribe(self.sub_id);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Pub/sub listen
+// ---------------------------------------------------------------------
+
+pub struct Notification {
+    pub id: i64,
+    pub channel: String,
+    pub payload: String,
+}
+
+impl Notification {
+    pub fn payload_as<T: DeserializeOwned>(&self) -> Result<T> {
+        Ok(serde_json::from_str(&self.payload)?)
+    }
+}
+
+pub struct Subscription {
+    inner: Arc<Inner>,
+    sub_id: u64,
+    rx: Receiver<()>,
+    channel: String,
+    last_id: i64,
+    pending: std::collections::VecDeque<Notification>,
+    closed: bool,
+}
+
+impl Subscription {
+    /// Block until the next notification arrives. Returns `None` only
+    /// when the WAL watcher is dropped. Also exposed via
+    /// `impl Iterator` so you can write `for n in sub { ... }`.
+    pub fn recv(&mut self) -> Option<Result<Notification>> {
+        if self.closed {
+            return None;
+        }
+        loop {
+            if let Some(n) = self.pending.pop_front() {
+                self.last_id = n.id;
+                return Some(Ok(n));
+            }
+            if let Err(e) = self.refill() {
+                return Some(Err(e));
+            }
+            if !self.pending.is_empty() {
+                continue;
+            }
+            while self.rx.try_recv().is_ok() {}
+            match self.rx.recv() {
+                Ok(()) => continue,
+                Err(_) => {
+                    self.closed = true;
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Non-blocking next. Returns `Ok(None)` if nothing is pending
+    /// right now.
+    pub fn try_next(&mut self) -> Result<Option<Notification>> {
+        if let Some(n) = self.pending.pop_front() {
+            self.last_id = n.id;
+            return Ok(Some(n));
+        }
+        self.refill()?;
+        if let Some(n) = self.pending.pop_front() {
+            self.last_id = n.id;
+            return Ok(Some(n));
+        }
+        Ok(None)
+    }
+
+    /// Recv with timeout. Returns `Ok(None)` on timeout.
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Option<Notification>> {
+        if let Some(n) = self.pending.pop_front() {
+            self.last_id = n.id;
+            return Ok(Some(n));
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            self.refill()?;
+            if let Some(n) = self.pending.pop_front() {
+                self.last_id = n.id;
+                return Ok(Some(n));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            while self.rx.try_recv().is_ok() {}
+            match self.rx.recv_timeout(deadline - now) {
+                Ok(()) => continue,
+                Err(RecvTimeoutError::Timeout) => return Ok(None),
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.closed = true;
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    fn refill(&mut self) -> Result<()> {
+        let rows: Vec<(i64, String, String)> = self.inner.with_conn(|c| {
+            let mut stmt = c.prepare_cached(
+                "SELECT id, channel, payload
+                 FROM _honker_notifications
+                 WHERE id > ?1 AND channel = ?2
+                 ORDER BY id ASC
+                 LIMIT 1000",
+            )?;
+            let iter = stmt.query_map(
+                params![self.last_id, self.channel],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+            )?;
+            iter.collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        for (id, channel, payload) in rows {
+            self.pending.push_back(Notification { id, channel, payload });
+        }
+        Ok(())
+    }
+}
+
+impl Iterator for Subscription {
+    type Item = Result<Notification>;
+    fn next(&mut self) -> Option<Self::Item> {
+        Subscription::recv(self)
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.inner.wal.unsubscribe(self.sub_id);
+    }
+}
+
+/// Raw WAL-commit waker. Useful for building your own poll loops.
+pub struct WalEvents {
+    inner: Arc<Inner>,
+    sub_id: u64,
+    rx: Receiver<()>,
+}
+
+impl WalEvents {
+    pub fn recv(&self) -> Result<()> {
+        self.rx.recv().map_err(|_| Error::WalClosed)
+    }
+
+    pub fn try_recv(&self) -> Option<()> {
+        self.rx.try_recv().ok()
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<()>> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(()) => Ok(Some(())),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err(Error::WalClosed),
+        }
+    }
+}
+
+impl Drop for WalEvents {
+    fn drop(&mut self) {
+        self.inner.wal.unsubscribe(self.sub_id);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Scheduler
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct ScheduledTask {
+    pub name: String,
+    pub queue: String,
+    pub cron: String,
+    pub payload: serde_json::Value,
+    pub priority: i64,
+    pub expires_s: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScheduledFire {
+    pub name: String,
+    pub queue: String,
+    pub fire_at: i64,
+    pub job_id: i64,
+}
+
+pub struct Scheduler {
+    inner: Arc<Inner>,
+}
+
+impl Scheduler {
+    /// Register a cron-scheduled task. Idempotent by `name`.
+    pub fn add(&self, task: ScheduledTask) -> Result<()> {
+        let payload_json = serde_json::to_string(&task.payload)?;
+        self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_scheduler_register(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    task.name,
+                    task.queue,
+                    task.cron,
+                    payload_json,
+                    task.priority,
+                    task.expires_s,
+                ],
+                |_| Ok(()),
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn remove(&self, name: &str) -> Result<i64> {
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_scheduler_unregister(?1)",
+                params![name],
+                |r| r.get::<_, i64>(0),
+            )
+        })?)
+    }
+
+    /// Fire due boundaries and return what was enqueued.
+    pub fn tick(&self) -> Result<Vec<ScheduledFire>> {
+        let now = chrono_like_now();
+        let rows_json: String = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_scheduler_tick(?1)",
+                params![now],
+                |r| r.get(0),
+            )
+        })?;
+        Ok(serde_json::from_str(&rows_json)?)
+    }
+
+    /// Soonest `next_fire_at` across all tasks, or 0 if no tasks.
+    pub fn soonest(&self) -> Result<i64> {
+        Ok(self.inner.with_conn(|c| {
+            c.query_row("SELECT honker_scheduler_soonest()", [], |r| r.get::<_, i64>(0))
+        })?)
+    }
+
+    /// Run the scheduler loop with leader election. Blocks until
+    /// `stop` is set. Only the process holding the `honker-scheduler`
+    /// lock fires; standbys wait for the lock to expire.
+    pub fn run(&self, stop: Arc<std::sync::atomic::AtomicBool>, owner: &str) -> Result<()> {
+        const LOCK_TTL: i64 = 60;
+        const HEARTBEAT: Duration = Duration::from_secs(20);
+        let mut last_heartbeat;
+
+        while !stop.load(std::sync::atomic::Ordering::Acquire) {
+            let acquired: i64 = self.inner.with_conn(|c| {
+                c.query_row(
+                    "SELECT honker_lock_acquire(?1, ?2, ?3)",
+                    params!["honker-scheduler", owner, LOCK_TTL],
+                    |r| r.get(0),
+                )
+            })?;
+            if acquired == 0 {
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+            last_heartbeat = std::time::Instant::now();
+
+            // Leader loop.
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                self.tick()?;
+                if last_heartbeat.elapsed() >= HEARTBEAT {
+                    let _ = self.inner.with_conn(|c| {
+                        c.query_row(
+                            "SELECT honker_lock_acquire(?1, ?2, ?3)",
+                            params!["honker-scheduler", owner, LOCK_TTL],
+                            |_| Ok(()),
+                        )
+                    });
+                    last_heartbeat = std::time::Instant::now();
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+
+            let _ = self.inner.with_conn(|c| {
+                c.query_row(
+                    "SELECT honker_lock_release(?1, ?2)",
+                    params!["honker-scheduler", owner],
+                    |_| Ok(()),
+                )
+            });
+        }
+        Ok(())
+    }
+}
+
+fn chrono_like_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------
+// Advisory locks (RAII)
+// ---------------------------------------------------------------------
+
+pub struct Lock {
+    inner: Arc<Inner>,
+    name: String,
+    owner: String,
+    released: bool,
+}
+
+impl Lock {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// Explicit release. Returns true if we still held it.
+    pub fn release(mut self) -> Result<bool> {
+        let n: i64 = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_lock_release(?1, ?2)",
+                params![self.name, self.owner],
+                |r| r.get(0),
+            )
+        })?;
+        self.released = true;
         Ok(n > 0)
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.inner.with_conn(|c| {
+                c.query_row(
+                    "SELECT honker_lock_release(?1, ?2)",
+                    params![self.name, self.owner],
+                    |_| Ok(()),
+                )
+            });
+        }
     }
 }
