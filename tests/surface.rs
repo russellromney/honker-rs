@@ -342,6 +342,101 @@ fn scheduler_run_stops_on_signal() {
 }
 
 #[test]
+fn lock_heartbeat_extends_ttl() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(tmp.path().join("t.db")).unwrap();
+
+    let lock = db.try_lock("key", "me", 1).unwrap().unwrap();
+    // Original TTL would expire in 1s; heartbeat extends to 60s.
+    assert!(lock.heartbeat(60).unwrap(), "still ours right after acquire");
+
+    // A different owner trying to acquire should fail.
+    assert!(
+        db.try_lock("key", "other", 60).unwrap().is_none(),
+        "heartbeat keeps us the owner"
+    );
+}
+
+#[test]
+fn notify_tx_rolls_back_with_tx() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(tmp.path().join("t.db")).unwrap();
+
+    let before: i64 = db.with_conn(|c| {
+        c.query_row("SELECT COUNT(*) FROM _honker_notifications", [], |r| r.get(0))
+            .unwrap()
+    });
+
+    {
+        let tx = db.transaction().unwrap();
+        db.notify_tx(&tx, "orders", &json!({"id": 1})).unwrap();
+        tx.rollback().unwrap();
+    }
+
+    let after: i64 = db.with_conn(|c| {
+        c.query_row("SELECT COUNT(*) FROM _honker_notifications", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(before, after, "rolled-back notify must not persist");
+}
+
+#[test]
+fn prune_notifications_keep_latest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(tmp.path().join("t.db")).unwrap();
+
+    for i in 0..10 {
+        db.notify("c", &json!({"i": i})).unwrap();
+    }
+
+    let deleted = db.prune_notifications_keep_latest(3).unwrap();
+    assert_eq!(deleted, 7);
+
+    let count: i64 = db.with_conn(|c| {
+        c.query_row("SELECT COUNT(*) FROM _honker_notifications", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn claim_waker_wakes_on_enqueue() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(tmp.path().join("t.db")).unwrap();
+    let q = db.queue("live", QueueOpts::default());
+    let waker = q.claim_waker();
+
+    // Empty queue — waker.try_next returns None.
+    assert!(waker.try_next("w").unwrap().is_none());
+
+    // Enqueue from another thread; the main thread blocks on waker.next.
+    let db2 = db.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        let q2 = db2.queue("live", QueueOpts::default());
+        q2.enqueue(&json!({"k": "v"}), EnqueueOpts::default()).unwrap();
+    });
+
+    // Use a timer-bounded assertion: the waker should return within 1s.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_waker = q.claim_waker();
+    std::thread::spawn(move || {
+        let job = worker_waker.next("w").unwrap();
+        tx.send(job).unwrap();
+    });
+    // Close the first, unused waker so it unsubscribes.
+    drop(waker);
+
+    let got = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("waker should wake within 2s");
+    let job = got.expect("should have a job");
+    let p: serde_json::Value = job.payload_as().unwrap();
+    assert_eq!(p["k"], "v");
+    job.ack().unwrap();
+}
+
+#[test]
 fn wal_events_wake_on_commit() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::open(tmp.path().join("t.db")).unwrap();

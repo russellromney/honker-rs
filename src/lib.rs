@@ -141,6 +141,22 @@ impl Database {
         })?)
     }
 
+    /// Fire a notification inside an open transaction. The signal is
+    /// visible to listeners only after the transaction commits.
+    pub fn notify_tx<P: Serialize>(
+        &self,
+        tx: &Transaction<'_>,
+        channel: &str,
+        payload: &P,
+    ) -> Result<i64> {
+        let json = serde_json::to_string(payload)?;
+        tx.query_row(
+            "SELECT notify(?1, ?2)",
+            params![channel, json],
+            |r| r.get::<_, i64>(0),
+        )
+    }
+
     /// Subscribe to a channel. Returns a blocking iterator that wakes
     /// on WAL commits and yields rows where `channel = ?` and
     /// `id > MAX(id)` at attach time. Historical notifications are
@@ -181,10 +197,13 @@ impl Database {
     /// Begin a transaction. Commit or rollback explicitly; on drop,
     /// an uncommitted transaction is rolled back.
     ///
-    /// Hold the returned `Transaction` on ONE thread: it pins the
-    /// connection mutex for its lifetime. Other `Database` calls on
-    /// the same connection (from another thread) block until you
-    /// commit or drop.
+    /// The returned `Transaction` pins the connection mutex for its
+    /// lifetime. Other `Database` calls from **another thread** block
+    /// until you commit or drop; calls on the **same thread** that
+    /// holds the transaction deadlock (the mutex is not reentrant).
+    /// Always route same-thread operations through `*_tx` methods:
+    /// `queue.enqueue_tx(&tx, ...)`, `stream.publish_tx(&tx, ...)`,
+    /// `stream.save_offset_tx(&tx, ...)`.
     pub fn transaction(&self) -> Result<Transaction<'_>> {
         let guard = self.inner.conn.lock();
         guard.execute("BEGIN IMMEDIATE", [])?;
@@ -257,17 +276,35 @@ impl Database {
         })?)
     }
 
-    /// Delete notifications older than `older_than_s` seconds.
+    /// Delete notifications older than `older_than_s` seconds. Returns
+    /// the number of rows deleted.
     pub fn prune_notifications(&self, older_than_s: i64) -> Result<i64> {
-        Ok(self.inner.with_conn(|c| {
-            c.query_row(
+        let n = self.inner.with_conn(|c| {
+            c.execute(
                 "DELETE FROM _honker_notifications
-                 WHERE created_at < unixepoch() - ?1
-                 RETURNING (SELECT changes())",
+                 WHERE created_at < unixepoch() - ?1",
                 params![older_than_s],
-                |r| r.get::<_, i64>(0),
-            ).or_else(|_| Ok::<i64, rusqlite::Error>(0))
-        })?)
+            )
+        })?;
+        Ok(n as i64)
+    }
+
+    /// Keep only the most recent `max_keep` notifications. Returns
+    /// the number of rows deleted.
+    pub fn prune_notifications_keep_latest(&self, max_keep: i64) -> Result<i64> {
+        let n = self.inner.with_conn(|c| {
+            c.execute(
+                "DELETE FROM _honker_notifications
+                 WHERE id < (
+                   SELECT COALESCE(MIN(id), 0) FROM (
+                     SELECT id FROM _honker_notifications
+                     ORDER BY id DESC LIMIT ?1
+                   )
+                 )",
+                params![max_keep],
+            )
+        })?;
+        Ok(n as i64)
     }
 
     /// Escape hatch: run a closure with a borrowed `&Connection`. The
@@ -600,11 +637,17 @@ impl ClaimWaker {
                     attempts: r.attempts,
                 }));
             }
-            // Drain any pending ticks so we don't busy-spin on a
-            // backlog of wakes that already missed their payload.
-            while self.rx.try_recv().is_ok() {}
+            // Block for the next WAL wake. recv() returns immediately
+            // if a tick is already pending from an enqueue that raced
+            // our try-claim; recv-then-drain coalesces bursts so we
+            // do one claim attempt per commit storm. Drain-BEFORE-recv
+            // would lose wakeups: an enqueue between try-claim and
+            // drain would send a tick we'd then throw away.
             match self.rx.recv() {
-                Ok(()) => continue,
+                Ok(()) => {
+                    while self.rx.try_recv().is_ok() {}
+                    continue;
+                }
                 Err(_) => return Ok(None),
             }
         }
@@ -880,9 +923,13 @@ impl Iterator for StreamSubscription {
             if !self.pending.is_empty() {
                 continue;
             }
-            while self.rx.try_recv().is_ok() {}
+            // Recv first, then drain — the opposite order would lose
+            // a wakeup when a publish lands between refill() and drain.
             match self.rx.recv() {
-                Ok(()) => continue,
+                Ok(()) => {
+                    while self.rx.try_recv().is_ok() {}
+                    continue;
+                }
                 Err(_) => return None,
             }
         }
@@ -941,9 +988,14 @@ impl Subscription {
             if !self.pending.is_empty() {
                 continue;
             }
-            while self.rx.try_recv().is_ok() {}
+            // Recv first, then drain — the opposite order would lose
+            // a wakeup when a notification lands between refill() and
+            // drain.
             match self.rx.recv() {
-                Ok(()) => continue,
+                Ok(()) => {
+                    while self.rx.try_recv().is_ok() {}
+                    continue;
+                }
                 Err(_) => {
                     self.closed = true;
                     return None;
@@ -984,9 +1036,11 @@ impl Subscription {
             if now >= deadline {
                 return Ok(None);
             }
-            while self.rx.try_recv().is_ok() {}
             match self.rx.recv_timeout(deadline - now) {
-                Ok(()) => continue,
+                Ok(()) => {
+                    while self.rx.try_recv().is_ok() {}
+                    continue;
+                }
                 Err(RecvTimeoutError::Timeout) => return Ok(None),
                 Err(RecvTimeoutError::Disconnected) => {
                     self.closed = true;
@@ -1142,51 +1196,75 @@ impl Scheduler {
     /// Run the scheduler loop with leader election. Blocks until
     /// `stop` is set. Only the process holding the `honker-scheduler`
     /// lock fires; standbys wait for the lock to expire.
+    ///
+    /// Errors from individual ticks release the lock before returning,
+    /// so a standby can pick up immediately without waiting for the
+    /// TTL to elapse.
     pub fn run(&self, stop: Arc<std::sync::atomic::AtomicBool>, owner: &str) -> Result<()> {
         const LOCK_TTL: i64 = 60;
         const HEARTBEAT: Duration = Duration::from_secs(20);
-        let mut last_heartbeat;
 
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
-            let acquired: i64 = self.inner.with_conn(|c| {
-                c.query_row(
-                    "SELECT honker_lock_acquire(?1, ?2, ?3)",
-                    params!["honker-scheduler", owner, LOCK_TTL],
-                    |r| r.get(0),
-                )
-            })?;
-            if acquired == 0 {
+            let acquired = lock_try_acquire(&self.inner, "honker-scheduler", owner, LOCK_TTL)?;
+            if !acquired {
                 std::thread::sleep(Duration::from_secs(5));
                 continue;
             }
-            last_heartbeat = std::time::Instant::now();
 
-            // Leader loop.
-            while !stop.load(std::sync::atomic::Ordering::Acquire) {
-                self.tick()?;
-                if last_heartbeat.elapsed() >= HEARTBEAT {
-                    let _ = self.inner.with_conn(|c| {
-                        c.query_row(
-                            "SELECT honker_lock_acquire(?1, ?2, ?3)",
-                            params!["honker-scheduler", owner, LOCK_TTL],
-                            |_| Ok(()),
-                        )
-                    });
-                    last_heartbeat = std::time::Instant::now();
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-
-            let _ = self.inner.with_conn(|c| {
-                c.query_row(
-                    "SELECT honker_lock_release(?1, ?2)",
-                    params!["honker-scheduler", owner],
-                    |_| Ok(()),
-                )
-            });
+            let result = self.leader_loop(&stop, owner, LOCK_TTL, HEARTBEAT);
+            let _ = lock_release(&self.inner, "honker-scheduler", owner);
+            result?; // surface any tick error AFTER releasing
         }
         Ok(())
     }
+
+    fn leader_loop(
+        &self,
+        stop: &Arc<std::sync::atomic::AtomicBool>,
+        owner: &str,
+        lock_ttl: i64,
+        heartbeat: Duration,
+    ) -> Result<()> {
+        let mut last_heartbeat = std::time::Instant::now();
+        while !stop.load(std::sync::atomic::Ordering::Acquire) {
+            self.tick()?;
+            if last_heartbeat.elapsed() >= heartbeat {
+                let still_ours =
+                    lock_try_acquire(&self.inner, "honker-scheduler", owner, lock_ttl)?;
+                if !still_ours {
+                    // Lost the lock (TTL expired, new leader). Drop
+                    // out of the leader loop so we don't double-fire
+                    // alongside whoever has it now.
+                    return Ok(());
+                }
+                last_heartbeat = std::time::Instant::now();
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        Ok(())
+    }
+}
+
+fn lock_try_acquire(inner: &Inner, name: &str, owner: &str, ttl_s: i64) -> Result<bool> {
+    let n: i64 = inner.with_conn(|c| {
+        c.query_row(
+            "SELECT honker_lock_acquire(?1, ?2, ?3)",
+            params![name, owner, ttl_s],
+            |r| r.get(0),
+        )
+    })?;
+    Ok(n == 1)
+}
+
+fn lock_release(inner: &Inner, name: &str, owner: &str) -> Result<bool> {
+    let n: i64 = inner.with_conn(|c| {
+        c.query_row(
+            "SELECT honker_lock_release(?1, ?2)",
+            params![name, owner],
+            |r| r.get(0),
+        )
+    })?;
+    Ok(n > 0)
 }
 
 fn chrono_like_now() -> i64 {
@@ -1227,6 +1305,14 @@ impl Lock {
         })?;
         self.released = true;
         Ok(n > 0)
+    }
+
+    /// Extend the TTL. Returns `Ok(true)` if we still hold the lock,
+    /// `Ok(false)` if the lock was stolen (TTL expired and someone
+    /// else acquired it). Check the return value — holding the `Lock`
+    /// value alone does not guarantee you still own the lock.
+    pub fn heartbeat(&self, ttl_s: i64) -> Result<bool> {
+        lock_try_acquire(&self.inner, &self.name, &self.owner, ttl_s)
     }
 }
 
