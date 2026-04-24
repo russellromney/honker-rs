@@ -18,7 +18,7 @@ categories = ["database", "concurrency"]
 # `path` resolves when this repo is a submodule inside the main
 # honker repo; `version` is what Cargo uses when honker-rs is
 # consumed from crates.io.
-honker-core = { path = "../../honker-core", version = "0.2" }
+honker-core = { path = "../../honker-core", version = "0.2.1" }
 rusqlite = { version = "0.39", features = ["functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
