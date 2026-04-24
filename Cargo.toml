@@ -1,6 +1,6 @@
 [package]
 name = "honker"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "SQLite-native task runtime: durable queues, streams, pub/sub, and scheduler. Ergonomic Rust wrapper over honker-core."
 license = "Apache-2.0"
