@@ -21,7 +21,7 @@
 //! Use the loadable extension (`honker-extension`) only when mixing
 //! with other SQLite clients on the same file.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,8 +92,7 @@ impl Database {
         honker_core::bootstrap_honker_schema(&conn)
             .map_err(|e| Error::Core(e.to_string()))?;
 
-        let wal_path = wal_path_for(path_ref);
-        let wal = SharedWalWatcher::new(wal_path);
+        let wal = SharedWalWatcher::new(path_ref.to_path_buf());
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -315,12 +314,6 @@ impl Database {
     {
         self.inner.with_conn(f)
     }
-}
-
-fn wal_path_for(db_path: &Path) -> PathBuf {
-    let mut s = db_path.as_os_str().to_os_string();
-    s.push("-wal");
-    PathBuf::from(s)
 }
 
 // ---------------------------------------------------------------------
