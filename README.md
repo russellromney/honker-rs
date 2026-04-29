@@ -49,7 +49,7 @@ tx.commit()?;
 
 ## WAL-waking workers
 
-`claim_waker` blocks until the next job lands, driven by the WAL watcher. No polling.
+`claim_waker` blocks until the next job lands, driven by the update watcher. No polling.
 
 ```rust
 let waker = q.claim_waker();

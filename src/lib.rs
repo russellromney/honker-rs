@@ -22,16 +22,16 @@
 //! with other SQLite clients on the same file.
 
 use std::path::Path;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use parking_lot::{Mutex, MutexGuard};
-use rusqlite::{params, Connection};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use honker_core::SharedWalWatcher;
+use honker_core::SharedUpdateWatcher;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -41,8 +41,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("core error: {0}")]
     Core(String),
-    #[error("wal channel closed")]
-    WalClosed,
+    #[error("update channel closed")]
+    UpdateClosed,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -53,7 +53,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 struct Inner {
     conn: Mutex<Connection>,
-    wal: SharedWalWatcher,
+    updates: SharedUpdateWatcher,
 }
 
 impl Inner {
@@ -86,18 +86,17 @@ impl Database {
         let path_ref = path.as_ref();
         let path_str = path_ref.to_string_lossy().into_owned();
 
-        let conn = honker_core::open_conn(&path_str, true)
-            .map_err(|e| Error::Core(e.to_string()))?;
+        let conn =
+            honker_core::open_conn(&path_str, true).map_err(|e| Error::Core(e.to_string()))?;
         honker_core::attach_honker_functions(&conn)?;
-        honker_core::bootstrap_honker_schema(&conn)
-            .map_err(|e| Error::Core(e.to_string()))?;
+        honker_core::bootstrap_honker_schema(&conn).map_err(|e| Error::Core(e.to_string()))?;
 
-        let wal = SharedWalWatcher::new(path_ref.to_path_buf());
+        let updates = SharedUpdateWatcher::new(path_ref.to_path_buf());
 
         Ok(Self {
             inner: Arc::new(Inner {
                 conn: Mutex::new(conn),
-                wal,
+                updates,
             }),
         })
     }
@@ -132,11 +131,9 @@ impl Database {
     pub fn notify<P: Serialize>(&self, channel: &str, payload: &P) -> Result<i64> {
         let json = serde_json::to_string(payload)?;
         Ok(self.inner.with_conn(|c| {
-            c.query_row(
-                "SELECT notify(?1, ?2)",
-                params![channel, json],
-                |r| r.get::<_, i64>(0),
-            )
+            c.query_row("SELECT notify(?1, ?2)", params![channel, json], |r| {
+                r.get::<_, i64>(0)
+            })
         })?)
     }
 
@@ -149,15 +146,13 @@ impl Database {
         payload: &P,
     ) -> Result<i64> {
         let json = serde_json::to_string(payload)?;
-        tx.query_row(
-            "SELECT notify(?1, ?2)",
-            params![channel, json],
-            |r| r.get::<_, i64>(0),
-        )
+        tx.query_row("SELECT notify(?1, ?2)", params![channel, json], |r| {
+            r.get::<_, i64>(0)
+        })
     }
 
     /// Subscribe to a channel. Returns a blocking iterator that wakes
-    /// on WAL commits and yields rows where `channel = ?` and
+    /// on database updates and yields rows where `channel = ?` and
     /// `id > MAX(id)` at attach time. Historical notifications are
     /// not replayed.
     pub fn listen(&self, channel: &str) -> Result<Subscription> {
@@ -168,7 +163,7 @@ impl Database {
                 |r| r.get(0),
             )
         })?;
-        let (sub_id, rx) = self.inner.wal.subscribe();
+        let (sub_id, rx) = self.inner.updates.subscribe();
         Ok(Subscription {
             inner: self.inner.clone(),
             sub_id,
@@ -180,13 +175,13 @@ impl Database {
         })
     }
 
-    /// Raw WAL-commit waker. `WalEvents::recv` blocks until the next
-    /// `.db-wal` change; `try_recv` is non-blocking. Useful when you
+    /// Raw update waker. `UpdateEvents::recv` blocks until the next
+    /// database update; `try_recv` is non-blocking. Useful when you
     /// want to drive a custom poll loop (batch claim, custom stream
     /// read pattern) without polling SQLite on a timer.
-    pub fn wal_events(&self) -> WalEvents {
-        let (sub_id, rx) = self.inner.wal.subscribe();
-        WalEvents {
+    pub fn update_events(&self) -> UpdateEvents {
+        let (sub_id, rx) = self.inner.updates.subscribe();
+        UpdateEvents {
             inner: self.inner.clone(),
             sub_id,
             rx,
@@ -260,11 +255,9 @@ impl Database {
     /// Fetch a stored result. Returns `None` if absent or expired.
     pub fn get_result(&self, job_id: i64) -> Result<Option<String>> {
         Ok(self.inner.with_conn(|c| {
-            c.query_row(
-                "SELECT honker_result_get(?1)",
-                params![job_id],
-                |r| r.get::<_, Option<String>>(0),
-            )
+            c.query_row("SELECT honker_result_get(?1)", params![job_id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
         })?)
     }
 
@@ -413,9 +406,9 @@ impl Queue {
     /// Enqueue on a freshly acquired connection.
     pub fn enqueue<P: Serialize>(&self, payload: &P, opts: EnqueueOpts) -> Result<i64> {
         let json = serde_json::to_string(payload)?;
-        Ok(self.inner.with_conn(|c| {
-            enqueue_on(c, &self.name, &json, self.opts.max_attempts, &opts)
-        })?)
+        Ok(self
+            .inner
+            .with_conn(|c| enqueue_on(c, &self.name, &json, self.opts.max_attempts, &opts))?)
     }
 
     /// Enqueue inside an open transaction. Atomic with whatever else
@@ -427,7 +420,13 @@ impl Queue {
         opts: EnqueueOpts,
     ) -> Result<i64> {
         let json = serde_json::to_string(payload)?;
-        Ok(enqueue_on(tx.conn(), &self.name, &json, self.opts.max_attempts, &opts)?)
+        Ok(enqueue_on(
+            tx.conn(),
+            &self.name,
+            &json,
+            self.opts.max_attempts,
+            &opts,
+        )?)
     }
 
     /// Atomically claim up to `n` jobs.
@@ -473,20 +472,18 @@ impl Queue {
     /// Sweep expired processing rows back to pending. Returns rows touched.
     pub fn sweep_expired(&self) -> Result<i64> {
         Ok(self.inner.with_conn(|c| {
-            c.query_row(
-                "SELECT honker_sweep_expired(?1)",
-                params![self.name],
-                |r| r.get::<_, i64>(0),
-            )
+            c.query_row("SELECT honker_sweep_expired(?1)", params![self.name], |r| {
+                r.get::<_, i64>(0)
+            })
         })?)
     }
 
-    /// Wait on WAL commits and yield jobs as they land. Blocks. Cancel
+    /// Wait on database updates and yield jobs as they land. Blocks. Cancel
     /// by dropping the `Database` or calling `stop()` on a shared
     /// `Arc<AtomicBool>` you thread in yourself — this helper is the
     /// minimum that actually replaces a polling loop.
     pub fn claim_waker(&self) -> ClaimWaker {
-        let (sub_id, rx) = self.inner.wal.subscribe();
+        let (sub_id, rx) = self.inner.updates.subscribe();
         ClaimWaker {
             inner: self.inner.clone(),
             name: self.name.clone(),
@@ -609,7 +606,7 @@ pub struct ClaimWaker {
 
 impl ClaimWaker {
     /// Block until a job is claimable, then claim and return it.
-    /// Returns `None` only if the shared WAL watcher is dropped.
+    /// Returns `None` only if the shared update watcher is dropped.
     pub fn next(&self, worker_id: &str) -> Result<Option<Job>> {
         loop {
             let rows_json: String = self.inner.with_conn(|c| {
@@ -670,7 +667,7 @@ impl ClaimWaker {
 
 impl Drop for ClaimWaker {
     fn drop(&mut self) {
-        self.inner.wal.unsubscribe(self.sub_id);
+        self.inner.updates.unsubscribe(self.sub_id);
     }
 }
 
@@ -734,11 +731,7 @@ impl Stream {
 
     /// Read events after this consumer's saved offset. Does NOT advance
     /// the offset — call `save_offset` after processing.
-    pub fn read_from_consumer(
-        &self,
-        consumer: &str,
-        limit: i64,
-    ) -> Result<Vec<StreamEvent>> {
+    pub fn read_from_consumer(&self, consumer: &str, limit: i64) -> Result<Vec<StreamEvent>> {
         let offset = self.get_offset(consumer)?;
         self.read_since(offset, limit)
     }
@@ -783,11 +776,11 @@ impl Stream {
     }
 
     /// Subscribe as a named consumer. Resumes from saved offset, wakes
-    /// on WAL commits, auto-saves after `save_every_n` events (or on
+    /// on database updates, auto-saves after `save_every_n` events (or on
     /// drop). Blocking iterator.
     pub fn subscribe(&self, consumer: &str) -> Result<StreamSubscription> {
         let offset = self.get_offset(consumer)?;
-        let (sub_id, rx) = self.inner.wal.subscribe();
+        let (sub_id, rx) = self.inner.updates.subscribe();
         Ok(StreamSubscription {
             inner: self.inner.clone(),
             topic: self.name.clone(),
@@ -904,10 +897,12 @@ impl Iterator for StreamSubscription {
         loop {
             if let Some(ev) = self.pending.pop_front() {
                 self.last_offset = ev.offset;
-                if self.save_every_n > 0 && self.last_offset - self.last_saved >= self.save_every_n
-                    && let Err(e) = self.save_offset() {
-                        return Some(Err(e));
-                    }
+                if self.save_every_n > 0
+                    && self.last_offset - self.last_saved >= self.save_every_n
+                    && let Err(e) = self.save_offset()
+                {
+                    return Some(Err(e));
+                }
                 return Some(Ok(ev));
             }
             if let Err(e) = self.refill() {
@@ -932,7 +927,7 @@ impl Iterator for StreamSubscription {
 impl Drop for StreamSubscription {
     fn drop(&mut self) {
         let _ = self.save_offset();
-        self.inner.wal.unsubscribe(self.sub_id);
+        self.inner.updates.unsubscribe(self.sub_id);
     }
 }
 
@@ -964,7 +959,7 @@ pub struct Subscription {
 
 impl Subscription {
     /// Block until the next notification arrives. Returns `None` only
-    /// when the WAL watcher is dropped. Also exposed via
+    /// when the update watcher is dropped. Also exposed via
     /// `impl Iterator` so you can write `for n in sub { ... }`.
     pub fn recv(&mut self) -> Option<Result<Notification>> {
         if self.closed {
@@ -1052,14 +1047,21 @@ impl Subscription {
                  ORDER BY id ASC
                  LIMIT 1000",
             )?;
-            let iter = stmt.query_map(
-                params![self.last_id, self.channel],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
-            )?;
+            let iter = stmt.query_map(params![self.last_id, self.channel], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
             iter.collect::<rusqlite::Result<Vec<_>>>()
         })?;
         for (id, channel, payload) in rows {
-            self.pending.push_back(Notification { id, channel, payload });
+            self.pending.push_back(Notification {
+                id,
+                channel,
+                payload,
+            });
         }
         Ok(())
     }
@@ -1074,20 +1076,20 @@ impl Iterator for Subscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        self.inner.wal.unsubscribe(self.sub_id);
+        self.inner.updates.unsubscribe(self.sub_id);
     }
 }
 
-/// Raw WAL-commit waker. Useful for building your own poll loops.
-pub struct WalEvents {
+/// Raw update waker. Useful for building your own poll loops.
+pub struct UpdateEvents {
     inner: Arc<Inner>,
     sub_id: u64,
     rx: Receiver<()>,
 }
 
-impl WalEvents {
+impl UpdateEvents {
     pub fn recv(&self) -> Result<()> {
-        self.rx.recv().map_err(|_| Error::WalClosed)
+        self.rx.recv().map_err(|_| Error::UpdateClosed)
     }
 
     pub fn try_recv(&self) -> Option<()> {
@@ -1098,14 +1100,14 @@ impl WalEvents {
         match self.rx.recv_timeout(timeout) {
             Ok(()) => Ok(Some(())),
             Err(RecvTimeoutError::Timeout) => Ok(None),
-            Err(RecvTimeoutError::Disconnected) => Err(Error::WalClosed),
+            Err(RecvTimeoutError::Disconnected) => Err(Error::UpdateClosed),
         }
     }
 }
 
-impl Drop for WalEvents {
+impl Drop for UpdateEvents {
     fn drop(&mut self) {
-        self.inner.wal.unsubscribe(self.sub_id);
+        self.inner.updates.unsubscribe(self.sub_id);
     }
 }
 
@@ -1170,11 +1172,9 @@ impl Scheduler {
     pub fn tick(&self) -> Result<Vec<ScheduledFire>> {
         let now = chrono_like_now();
         let rows_json: String = self.inner.with_conn(|c| {
-            c.query_row(
-                "SELECT honker_scheduler_tick(?1)",
-                params![now],
-                |r| r.get(0),
-            )
+            c.query_row("SELECT honker_scheduler_tick(?1)", params![now], |r| {
+                r.get(0)
+            })
         })?;
         Ok(serde_json::from_str(&rows_json)?)
     }
@@ -1182,7 +1182,9 @@ impl Scheduler {
     /// Soonest `next_fire_at` across all tasks, or 0 if no tasks.
     pub fn soonest(&self) -> Result<i64> {
         Ok(self.inner.with_conn(|c| {
-            c.query_row("SELECT honker_scheduler_soonest()", [], |r| r.get::<_, i64>(0))
+            c.query_row("SELECT honker_scheduler_soonest()", [], |r| {
+                r.get::<_, i64>(0)
+            })
         })?)
     }
 
