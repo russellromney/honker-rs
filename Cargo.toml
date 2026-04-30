@@ -25,5 +25,8 @@ serde_json = "1"
 thiserror = "2"
 parking_lot = "0.12"
 
+[target.'cfg(windows)'.dependencies]
+honker-core = { path = "../../honker-core", version = "0.2.1", features = ["bundled-sqlite"] }
+
 [dev-dependencies]
 tempfile = "3"
