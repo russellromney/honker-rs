@@ -1,9 +1,9 @@
 //! Feature-parity surface tests: transactions, streams, listen,
 //! scheduler, locks, rate limits, results.
 
-use honker::{Database, EnqueueOpts, QueueOpts, ScheduledTask};
+use honker::{Database, EnqueueOpts, QueueOpts, ScheduledFire, ScheduledTask};
 use serde_json::json;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
 #[test]
@@ -155,7 +155,11 @@ fn stream_consumer_offsets() {
     assert!(s.save_offset("email-worker", last).unwrap());
 
     // Next read is empty until new publishes.
-    assert!(s.read_from_consumer("email-worker", 100).unwrap().is_empty());
+    assert!(
+        s.read_from_consumer("email-worker", 100)
+            .unwrap()
+            .is_empty()
+    );
 
     s.publish(&json!({"n": 4})).unwrap();
     let next = s.read_from_consumer("email-worker", 100).unwrap();
@@ -233,7 +237,10 @@ fn listen_filters_by_channel() {
 
     // No more orders pending.
     let next = sub.recv_timeout(Duration::from_millis(100)).unwrap();
-    assert!(next.is_none(), "shipments notifs must not leak into orders sub");
+    assert!(
+        next.is_none(),
+        "shipments notifs must not leak into orders sub"
+    );
 }
 
 #[test]
@@ -246,7 +253,7 @@ fn scheduler_register_and_tick() {
         .add(ScheduledTask {
             name: "every-minute".into(),
             queue: "health".into(),
-            cron: "* * * * *".into(),
+            schedule: "* * * * *".into(),
             payload: json!({"k": "v"}),
             priority: 0,
             expires_s: None,
@@ -316,7 +323,11 @@ fn results_save_and_get() {
     let v = db.get_result(42).unwrap();
     assert_eq!(v.as_deref(), Some(r#"{"ok":true}"#));
 
-    assert_eq!(db.get_result(999).unwrap(), None, "missing key returns None");
+    assert_eq!(
+        db.get_result(999).unwrap(),
+        None,
+        "missing key returns None"
+    );
 }
 
 #[test]
@@ -348,7 +359,10 @@ fn lock_heartbeat_extends_ttl() {
 
     let lock = db.try_lock("key", "me", 1).unwrap().unwrap();
     // Original TTL would expire in 1s; heartbeat extends to 60s.
-    assert!(lock.heartbeat(60).unwrap(), "still ours right after acquire");
+    assert!(
+        lock.heartbeat(60).unwrap(),
+        "still ours right after acquire"
+    );
 
     // A different owner trying to acquire should fail.
     assert!(
@@ -363,8 +377,10 @@ fn notify_tx_rolls_back_with_tx() {
     let db = Database::open(tmp.path().join("t.db")).unwrap();
 
     let before: i64 = db.with_conn(|c| {
-        c.query_row("SELECT COUNT(*) FROM _honker_notifications", [], |r| r.get(0))
-            .unwrap()
+        c.query_row("SELECT COUNT(*) FROM _honker_notifications", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
     });
 
     {
@@ -374,8 +390,10 @@ fn notify_tx_rolls_back_with_tx() {
     }
 
     let after: i64 = db.with_conn(|c| {
-        c.query_row("SELECT COUNT(*) FROM _honker_notifications", [], |r| r.get(0))
-            .unwrap()
+        c.query_row("SELECT COUNT(*) FROM _honker_notifications", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
     });
     assert_eq!(before, after, "rolled-back notify must not persist");
 }
@@ -393,8 +411,10 @@ fn prune_notifications_keep_latest() {
     assert_eq!(deleted, 7);
 
     let count: i64 = db.with_conn(|c| {
-        c.query_row("SELECT COUNT(*) FROM _honker_notifications", [], |r| r.get(0))
-            .unwrap()
+        c.query_row("SELECT COUNT(*) FROM _honker_notifications", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
     });
     assert_eq!(count, 3);
 }
@@ -414,7 +434,8 @@ fn claim_waker_wakes_on_enqueue() {
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(30));
         let q2 = db2.queue("live", QueueOpts::default());
-        q2.enqueue(&json!({"k": "v"}), EnqueueOpts::default()).unwrap();
+        q2.enqueue(&json!({"k": "v"}), EnqueueOpts::default())
+            .unwrap();
     });
 
     // Use a timer-bounded assertion: the waker should return within 1s.
@@ -437,11 +458,78 @@ fn claim_waker_wakes_on_enqueue() {
 }
 
 #[test]
-fn wal_events_wake_on_commit() {
+fn claim_waker_wakes_on_run_at_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(tmp.path().join("t.db")).unwrap();
+    let q = db.queue("runat", QueueOpts::default());
+
+    q.enqueue(
+        &json!({"x": 1}),
+        EnqueueOpts {
+            run_at: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+                    + 1,
+            ),
+            ..EnqueueOpts::default()
+        },
+    )
+    .unwrap();
+
+    let waker = q.claim_waker();
+    let start = std::time::Instant::now();
+    let job = waker.next("w").unwrap().expect("should have a job");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(700),
+        "run_at wake came too early: {:?}",
+        elapsed
+    );
+    assert!(
+        elapsed <= Duration::from_millis(2500),
+        "run_at wake came too late: {:?}",
+        elapsed
+    );
+    job.ack().unwrap();
+}
+
+#[test]
+fn scheduler_accepts_every_second_expression() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(tmp.path().join("t.db")).unwrap();
+    let sched = db.scheduler();
+
+    sched
+        .add(ScheduledTask {
+            name: "fast".into(),
+            queue: "beats".into(),
+            schedule: "@every 1s".into(),
+            payload: json!({"ok": true}),
+            priority: 0,
+            expires_s: None,
+        })
+        .unwrap();
+
+    let soonest = sched.soonest().unwrap();
+    assert!(soonest > 0);
+
+    let rows_json: String = db
+        .with_conn(|c| {
+            c.query_row("SELECT honker_scheduler_tick(?1)", [soonest], |r| r.get(0))
+                .unwrap()
+        });
+    let fires: Vec<ScheduledFire> = serde_json::from_str(&rows_json).unwrap();
+    assert_eq!(fires.len(), 1);
+}
+
+#[test]
+fn update_events_wake_on_commit() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::open(tmp.path().join("t.db")).unwrap();
 
-    let events = db.wal_events();
+    let events = db.update_events();
 
     let db2 = db.clone();
     std::thread::spawn(move || {
