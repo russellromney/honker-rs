@@ -492,6 +492,7 @@ impl Queue {
             rx,
         }
     }
+
 }
 
 fn enqueue_on(
@@ -627,18 +628,21 @@ impl ClaimWaker {
                     attempts: r.attempts,
                 }));
             }
-            // Block for the next WAL wake. recv() returns immediately
-            // if a tick is already pending from an enqueue that raced
-            // our try-claim; recv-then-drain coalesces bursts so we
-            // do one claim attempt per commit storm. Drain-BEFORE-recv
-            // would lose wakeups: an enqueue between try-claim and
-            // drain would send a tick we'd then throw away.
-            match self.rx.recv() {
-                Ok(()) => {
-                    while self.rx.try_recv().is_ok() {}
-                    continue;
-                }
-                Err(_) => return Ok(None),
+            let next_at: i64 = self.inner.with_conn(|c| {
+                c.query_row(
+                    "SELECT honker_queue_next_claim_at(?1)",
+                    params![self.name],
+                    |r| r.get::<_, i64>(0),
+                )
+            })?;
+            if next_at > 0 && next_at <= chrono_like_now() {
+                continue;
+            }
+            match recv_until(&self.rx, next_at) {
+                Ok(true) => continue,
+                Ok(false) => continue,
+                Err(RecvTimeoutError::Disconnected) => return Ok(None),
+                Err(RecvTimeoutError::Timeout) => continue,
             }
         }
     }
@@ -1198,19 +1202,32 @@ impl Scheduler {
     pub fn run(&self, stop: Arc<std::sync::atomic::AtomicBool>, owner: &str) -> Result<()> {
         const LOCK_TTL: i64 = 60;
         const HEARTBEAT: Duration = Duration::from_secs(20);
+        let (sub_id, rx) = self.inner.updates.subscribe();
 
-        while !stop.load(std::sync::atomic::Ordering::Acquire) {
-            let acquired = lock_try_acquire(&self.inner, "honker-scheduler", owner, LOCK_TTL)?;
-            if !acquired {
-                std::thread::sleep(Duration::from_secs(5));
-                continue;
+        let result = (|| -> Result<()> {
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                let acquired =
+                    lock_try_acquire(&self.inner, "honker-scheduler", owner, LOCK_TTL)?;
+                if !acquired {
+                    match rx.recv_timeout(Duration::from_secs(5)) {
+                        Ok(()) => {
+                            while rx.try_recv().is_ok() {}
+                            continue;
+                        }
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                    }
+                }
+
+                let leader_result = self.leader_loop(&stop, owner, LOCK_TTL, HEARTBEAT, &rx);
+                let _ = lock_release(&self.inner, "honker-scheduler", owner);
+                leader_result?;
             }
+            Ok(())
+        })();
 
-            let result = self.leader_loop(&stop, owner, LOCK_TTL, HEARTBEAT);
-            let _ = lock_release(&self.inner, "honker-scheduler", owner);
-            result?; // surface any tick error AFTER releasing
-        }
-        Ok(())
+        self.inner.updates.unsubscribe(sub_id);
+        result
     }
 
     fn leader_loop(
@@ -1219,6 +1236,7 @@ impl Scheduler {
         owner: &str,
         lock_ttl: i64,
         heartbeat: Duration,
+        rx: &Receiver<()>,
     ) -> Result<()> {
         let mut last_heartbeat = std::time::Instant::now();
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -1234,9 +1252,54 @@ impl Scheduler {
                 }
                 last_heartbeat = std::time::Instant::now();
             }
-            std::thread::sleep(Duration::from_secs(1));
+            let mut wait_for = heartbeat.saturating_sub(last_heartbeat.elapsed());
+            let soonest = self.soonest()?;
+            if soonest > 0 {
+                let now = chrono_like_now();
+                let until_soonest = if soonest <= now {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs((soonest - now) as u64)
+                };
+                if until_soonest < wait_for {
+                    wait_for = until_soonest;
+                }
+            }
+            match rx.recv_timeout(wait_for) {
+                Ok(()) => {
+                    while rx.try_recv().is_ok() {}
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
         }
         Ok(())
+    }
+}
+
+fn recv_until(rx: &Receiver<()>, unix_sec: i64) -> std::result::Result<bool, RecvTimeoutError> {
+    if unix_sec <= 0 {
+        match rx.recv() {
+            Ok(()) => {
+                while rx.try_recv().is_ok() {}
+                Ok(true)
+            }
+            Err(_) => Err(RecvTimeoutError::Disconnected),
+        }
+    } else {
+        let now = chrono_like_now();
+        let timeout = if unix_sec <= now {
+            Duration::ZERO
+        } else {
+            Duration::from_secs((unix_sec - now) as u64)
+        };
+        match rx.recv_timeout(timeout) {
+            Ok(()) => {
+                while rx.try_recv().is_ok() {}
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

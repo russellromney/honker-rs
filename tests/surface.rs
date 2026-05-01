@@ -1,7 +1,7 @@
 //! Feature-parity surface tests: transactions, streams, listen,
 //! scheduler, locks, rate limits, results.
 
-use honker::{Database, EnqueueOpts, QueueOpts, ScheduledTask};
+use honker::{Database, EnqueueOpts, QueueOpts, ScheduledFire, ScheduledTask};
 use serde_json::json;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
@@ -455,6 +455,73 @@ fn claim_waker_wakes_on_enqueue() {
     let p: serde_json::Value = job.payload_as().unwrap();
     assert_eq!(p["k"], "v");
     job.ack().unwrap();
+}
+
+#[test]
+fn claim_waker_wakes_on_run_at_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(tmp.path().join("t.db")).unwrap();
+    let q = db.queue("runat", QueueOpts::default());
+
+    q.enqueue(
+        &json!({"x": 1}),
+        EnqueueOpts {
+            run_at: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+                    + 1,
+            ),
+            ..EnqueueOpts::default()
+        },
+    )
+    .unwrap();
+
+    let waker = q.claim_waker();
+    let start = std::time::Instant::now();
+    let job = waker.next("w").unwrap().expect("should have a job");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(700),
+        "run_at wake came too early: {:?}",
+        elapsed
+    );
+    assert!(
+        elapsed <= Duration::from_millis(2500),
+        "run_at wake came too late: {:?}",
+        elapsed
+    );
+    job.ack().unwrap();
+}
+
+#[test]
+fn scheduler_accepts_every_second_expression() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(tmp.path().join("t.db")).unwrap();
+    let sched = db.scheduler();
+
+    sched
+        .add(ScheduledTask {
+            name: "fast".into(),
+            queue: "beats".into(),
+            cron: "@every 1s".into(),
+            payload: json!({"ok": true}),
+            priority: 0,
+            expires_s: None,
+        })
+        .unwrap();
+
+    let soonest = sched.soonest().unwrap();
+    assert!(soonest > 0);
+
+    let rows_json: String = db
+        .with_conn(|c| {
+            c.query_row("SELECT honker_scheduler_tick(?1)", [soonest], |r| r.get(0))
+                .unwrap()
+        });
+    let fires: Vec<ScheduledFire> = serde_json::from_str(&rows_json).unwrap();
+    assert_eq!(fires.len(), 1);
 }
 
 #[test]
