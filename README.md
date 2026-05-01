@@ -1,6 +1,6 @@
 # honker (Rust)
 
-Ergonomic Rust binding for [Honker](https://honker.dev). Durable queues, streams, pub/sub, and cron scheduler on SQLite. One file, zero servers.
+Ergonomic Rust binding for [Honker](https://honker.dev). Durable queues, streams, pub/sub, and time-trigger scheduling on SQLite. One file, zero servers.
 
 ## Install
 
@@ -90,7 +90,7 @@ while let Some(notif) = sub.recv() {
 
 ## Scheduler
 
-Cron-style periodic tasks with leader election. Multiple processes can call `run()`; only the lock holder fires.
+Recurring schedules with leader election. Multiple processes can call `run()`; only the lock holder fires.
 
 ```rust
 use honker::ScheduledTask;
@@ -100,7 +100,7 @@ let sched = db.scheduler();
 sched.add(ScheduledTask {
     name: "nightly".into(),
     queue: "backups".into(),
-    cron: "0 3 * * *".into(),
+    schedule: "0 3 * * *".into(),
     payload: json!({"target": "s3"}),
     priority: 0,
     expires_s: Some(3600),

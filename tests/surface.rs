@@ -253,7 +253,7 @@ fn scheduler_register_and_tick() {
         .add(ScheduledTask {
             name: "every-minute".into(),
             queue: "health".into(),
-            cron: "* * * * *".into(),
+            schedule: "* * * * *".into(),
             payload: json!({"k": "v"}),
             priority: 0,
             expires_s: None,
@@ -505,7 +505,7 @@ fn scheduler_accepts_every_second_expression() {
         .add(ScheduledTask {
             name: "fast".into(),
             queue: "beats".into(),
-            cron: "@every 1s".into(),
+            schedule: "@every 1s".into(),
             payload: json!({"ok": true}),
             priority: 0,
             expires_s: None,

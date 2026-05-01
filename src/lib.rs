@@ -1123,7 +1123,7 @@ impl Drop for UpdateEvents {
 pub struct ScheduledTask {
     pub name: String,
     pub queue: String,
-    pub cron: String,
+    pub schedule: String,
     pub payload: serde_json::Value,
     pub priority: i64,
     pub expires_s: Option<i64>,
@@ -1142,7 +1142,7 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    /// Register a cron-scheduled task. Idempotent by `name`.
+    /// Register a recurring task. Idempotent by `name`.
     pub fn add(&self, task: ScheduledTask) -> Result<()> {
         let payload_json = serde_json::to_string(&task.payload)?;
         self.inner.with_conn(|c| {
@@ -1151,7 +1151,7 @@ impl Scheduler {
                 params![
                     task.name,
                     task.queue,
-                    task.cron,
+                    task.schedule,
                     payload_json,
                     task.priority,
                     task.expires_s,
