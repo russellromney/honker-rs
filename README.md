@@ -1,43 +1,20 @@
 # honker-rs
 
-Rust binding for [Honker](https://github.com/russellromney/honker): durable queues, streams, pub/sub, and time-trigger scheduling on SQLite.
+This repository is archived.
 
-Full docs:
+Honker's maintained bindings now live in the main Honker repo:
+https://github.com/russellromney/honker/tree/main/packages/honker-rs
 
-- [Main repo](https://github.com/russellromney/honker)
-- [Docs](https://honker.dev)
+Use that path for source, issues, pull requests, examples, and release work.
 
-## Install
+Main repo:
 
-Add the crate, and make sure the Honker SQLite extension is available at runtime.
+https://github.com/russellromney/honker
 
-## Quick start
+Docs:
 
-```rust
-let db = honker::Database::open("app.db", "./libhonker_ext.dylib")?;
-let q = db.queue("emails");
+https://honker.dev
 
-q.enqueue(serde_json::json!({ "to": "alice@example.com" }))?;
+The Rust binding crate source now lives in the main repo.
 
-if let Some(job) = q.claim_one("worker-1")? {
-    send_email(&job.payload);
-    job.ack()?;
-}
-```
-
-Delayed jobs use `run_at` / `RunAt`-style options in the binding API.
-
-Recurring schedules use schedule expressions:
-
-```rust
-let sched = db.scheduler();
-sched.add("fast", "emails", "@every 1s", serde_json::json!({ "kind": "tick" }))?;
-```
-
-Supported schedule forms:
-
-- `0 3 * * *`
-- `*/2 * * * * *`
-- `@every 1s`
-
-For full API details, async wake behavior, streams, and SQL functions, see the main repo and docs site.
+This repo stays online as a signpost for old links.
